@@ -3329,11 +3329,20 @@ static NTSTATUS open_dll_file( UNICODE_STRING *nt_name, WINE_MODREF **pwm, HANDL
     status = NtCreateSection( mapping, STANDARD_RIGHTS_REQUIRED | SECTION_QUERY |
                               SECTION_MAP_READ | SECTION_MAP_EXECUTE,
                               NULL, &size, PAGE_EXECUTE_READ, SEC_IMAGE, handle );
+#ifdef __arm64ec__
+    if (status == STATUS_INVALID_IMAGE_FORMAT)
+        ERR( "[pe-image] section rejected %s status=%08lx\n", debugstr_us(nt_name), status );
+#endif
     if (!status)
     {
         NtQuerySection( *mapping, SectionImageInformation, image_info, sizeof(*image_info), NULL );
         if (!is_valid_binary( handle, image_info ))
         {
+#ifdef __arm64ec__
+            ERR( "[pe-image] architecture rejected %s file_machine=%04x current_machine=%04x wow_teb=%ld code=%u\n",
+                 debugstr_us(nt_name), image_info->Machine, current_machine,
+                 (long)NtCurrentTeb()->WowTebOffset, image_info->ImageContainsCode );
+#endif
             TRACE( "%s is for arch %x, continuing search\n", debugstr_us(nt_name), image_info->Machine );
             status = STATUS_NOT_SUPPORTED;
             NtClose( *mapping );
@@ -3411,10 +3420,21 @@ static NTSTATUS load_native_dll( LPCWSTR load_path, const UNICODE_STRING *nt_nam
 {
     void *module = NULL;
     SIZE_T len = 0;
+#ifdef __arm64ec__
+    BOOL module_setup_attempted = FALSE;
+#endif
     NTSTATUS status = NtMapViewOfSection( mapping, NtCurrentProcess(), &module, 0, 0, NULL, &len,
                                           ViewShare, 0, PAGE_EXECUTE_READ );
 
-    if (!NT_SUCCESS(status)) return status;
+    if (!NT_SUCCESS(status))
+    {
+#ifdef __arm64ec__
+        if (status == STATUS_INVALID_IMAGE_FORMAT)
+            ERR( "[pe-image] map rejected %s status=%08lx machine=%04x\n",
+                 debugstr_us(nt_name), status, image_info->Machine );
+#endif
+        return status;
+    }
 
     if ((*pwm = find_existing_module( module )))  /* already loaded */
     {
@@ -3429,8 +3449,20 @@ static NTSTATUS load_native_dll( LPCWSTR load_path, const UNICODE_STRING *nt_nam
     if (status == STATUS_IMAGE_MACHINE_TYPE_MISMATCH && !convert_to_pe64( module, image_info ))
         status = STATUS_INVALID_IMAGE_FORMAT;
 #endif
-    if (NT_SUCCESS(status)) status = build_module( load_path, nt_name, &module, image_info, id,
-                                                   flags, system, redirected, pwm );
+    if (NT_SUCCESS(status))
+    {
+#ifdef __arm64ec__
+        module_setup_attempted = TRUE;
+#endif
+        status = build_module( load_path, nt_name, &module, image_info, id,
+                               flags, system, redirected, pwm );
+    }
+#ifdef __arm64ec__
+    if (status == STATUS_INVALID_IMAGE_FORMAT)
+        ERR( "[pe-image] %s rejected %s status=%08lx machine=%04x\n",
+             module_setup_attempted ? "module setup" : "PE64 conversion",
+             debugstr_us(nt_name), status, image_info->Machine );
+#endif
 #ifdef __arm64ec__
     /* iOS-Madeira ml709: tell the emulator this image's code is executable, here rather
      * than relying on NtMapViewOfSection's notification -- that one never fires in a
